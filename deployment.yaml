@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pe-wa-deployment
+  name: etoko-folio-deployment
 spec:
   replicas: 6  # Number of desired replicas
   selector:
     matchLabels:
-      app: pe-wa
+      app: etoko-folio
   template:
     metadata:
       labels:
-        app: pe-wa
+        app: etoko-folio
     spec:
       containers:
-      - name: pe-wa
-        image: yash5090/pe-wa:latest
+      - name: etoko-folio
+        image: yash5090/etoko-folio:latest
         ports:
         - containerPort: 5000
