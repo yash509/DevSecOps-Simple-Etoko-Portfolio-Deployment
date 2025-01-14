@@ -1,0 +1,266 @@
+version: 2.1
+
+executors:
+  docker-executor:
+    docker:
+      - image: "openjdk:17-jdk"  # Java environment for JDK tools
+      - image: "node:16"          # Node.js environment for NodeJS tools
+      - image: "alpine:3.15"      # General purpose alpine image for cleanup and utilities
+    working_directory: ~/repo
+
+jobs:
+  clean_workspace:
+    docker:
+      - image: "alpine:3.15"
+    steps:
+      - run:
+          name: Clean Workspace
+          command: rm -rf ./*
+
+  unit_tests:
+    docker:
+      - image: "node:16"
+    steps:
+      - run:
+          name: Run Unit Tests
+          command: |
+            jenkins --version
+            aws --version
+            kubectl version --client
+            terraform --version
+            trivy --version
+            docker --version
+            ansible --version
+            snyk --version
+            vault --version
+
+  debug_vault_credentials:
+    docker:
+      - image: "alpine:3.15"
+    steps:
+      - run:
+          name: Debugging HashiCorp Vault Credentials
+          command: |
+            echo "Verifying Vault Credentials Configuration..."
+            vault status
+
+  fetch_credentials_from_vault:
+    docker:
+      - image: "alpine:3.15"
+    steps:
+      - run:
+          name: Fetch GitHub and AWS credentials from Vault
+          command: |
+            export VAULT_ADDR="${VAULT_URL}"
+            VAULT_TOKEN=$(vault write -field=token auth/approle/login role_id=${VAULT_ROLE_ID} secret_id=${VAULT_SECRET_ID})
+            AWS_ACCESS_KEY_ID=$(vault kv get -field=aws_access_key_id aws/terraform-project)
+            AWS_SECRET_ACCESS_KEY=$(vault kv get -field=aws_secret_access_key aws/terraform-project)
+            echo "AWS credentials fetched and exported."
+
+  docker_ecr_auth:
+    docker:
+      - image: "amazon/aws-cli:latest"
+    steps:
+      - run:
+          name: Docker Authentication with ECR
+          command: |
+            aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+
+  checkout_code:
+    docker:
+      - image: "alpine:3.15"
+    steps:
+      - checkout
+
+  deploy_staging:
+    docker:
+      - image: "google/cloud-sdk:alpine"
+    steps:
+      - run:
+          name: Test deploy to staging
+          command: echo 'staging deployment done'
+
+  deploy_production:
+    docker:
+      - image: "google/cloud-sdk:alpine"
+    steps:
+      - run:
+          name: Test deploy to production
+          command: echo 'production deployment done'
+
+  build_docker_image:
+    docker:
+      - image: "docker:20.10"
+    steps:
+      - run:
+          name: Build Docker Image
+          command: |
+            docker build -t ${IMAGE_NAME}:${TAG} .
+
+  tag_and_push_docker_image:
+    docker:
+      - image: "docker:20.10"
+    steps:
+      - run:
+          name: Tag and Push Docker Image
+          command: |
+            docker tag ${IMAGE_NAME}:${TAG} ${REPOSITORY_URI}:${IMAGE_TAG}
+            docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}
+
+  sonar_analysis:
+    docker:
+      - image: "sonarsource/sonar-scanner-cli"
+    steps:
+      - run:
+          name: SonarQube Analysis
+          command: |
+            sonar-scanner -Dsonar.projectKey=web-application -Dsonar.projectName=web-application
+
+  quality_gate:
+    docker:
+      - image: "alpine:3.15"
+    steps:
+      - run:
+          name: Quality Gate
+          command: waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+
+  owasp_scan:
+    docker:
+      - image: "dependency-check:latest"
+    steps:
+      - run:
+          name: Run OWASP Dependency Check
+          command: |
+            dependency-check --scan ./ --disableYarnAudit --disableNodeAudit
+
+  trivy_scan:
+    docker:
+      - image: "aquasec/trivy"
+    steps:
+      - run:
+          name: Run Trivy File System Scan
+          command: trivy fs . > trivyfs.txt
+
+  snyk_scan:
+    docker:
+      - image: "node:16"
+    steps:
+      - run:
+          name: Snyk Loaded Vulnerability Test
+          command: |
+            snyk auth $SNYK_API_TOKEN
+            snyk test --all-projects --report || true
+            snyk code test --json-file-output=vuln1.json > snykloadedvulnerabilityreport.txt || true
+
+  snyk_container_scan:
+    docker:
+      - image: "node:16"
+    steps:
+      - run:
+          name: Snyk Docker Image/Container Vulnerability Scanning
+          command: |
+            snyk container test ${IMAGE_NAME}:${TAG} > snyk-containertest-vulnerabilityreport.txt --report || true
+            snyk container monitor ${IMAGE_NAME}:${TAG} > snyk-containermonitor-vulnerabilityreport.txt || true
+
+  grype_scan:
+    docker:
+      - image: "anchore/grype:v0.82.0"
+    steps:
+      - run:
+          name: Anchore Grype Docker Image Vulnerability Scan
+          command: |
+            docker run --rm anchore/grype:v0.82.0 ${IMAGE_NAME}:${TAG}
+            docker run --rm anchore/grype:v0.82.0 -o json ${IMAGE_NAME}:${TAG} > grypescanreport.json
+
+  docker_scout_scan:
+    docker:
+      - image: "docker:20.10"
+    steps:
+      - run:
+          name: Docker Scout Image Overview and Scanning
+          command: |
+            docker-scout quickview ${IMAGE_NAME}:${TAG}
+            docker-scout cves ${IMAGE_NAME}:${TAG}
+            docker-scout recommendations ${IMAGE_NAME}:${TAG}
+            docker-scout attestation ${IMAGE_NAME}:${TAG}
+
+  deploy_to_docker:
+    docker:
+      - image: "docker:20.10"
+    steps:
+      - run:
+          name: Deploy to Docker Container
+          command: |
+            docker run -d --name etoko-folio -p 5000:80 ${IMAGE_NAME}:${TAG}
+
+  deploy_to_k8s:
+    docker:
+      - image: "google/cloud-sdk:alpine"
+    steps:
+      - run:
+          name: Deploy to Kubernetes
+          command: |
+            kubectl apply -f ${DEPLOY_ENV == 'blue' ? 'app-deployment-blue.yaml' : 'app-deployment-green.yaml'}
+            kubectl apply -f service.yaml
+            kubectl apply -f job.yaml
+            kubectl apply -f pv.yaml
+            kubectl apply -f pvc.yaml
+            kubectl apply -f nwp.yaml
+            kubectl apply -f ingress.yaml
+
+  switch_traffic:
+    docker:
+      - image: "google/cloud-sdk:alpine"
+    steps:
+      - run:
+          name: Switch Traffic Between Blue and Green Environment
+          command: |
+            kubectl patch service etoko-folio-service -p '{"spec": {"selector": {"app": "etoko-folio", "version": "${DEPLOY_ENV}"}}}'
+
+  verify_k8s_deployment:
+    docker:
+      - image: "google/cloud-sdk:alpine"
+    steps:
+      - run:
+          name: Verify Kubernetes Deployments
+          command: |
+            kubectl get all
+            kubectl get pods
+            kubectl get svc
+            kubectl get ns
+
+workflows:
+  version: 2
+  build_and_deploy:
+    jobs:
+      - clean_workspace
+      - unit_tests
+      - debug_vault_credentials
+      - fetch_credentials_from_vault
+      - sonar_analysis
+      - owasp_scan
+      - trivy_scan
+      - snyk_scan
+      - snyk_container_scan
+      - grype_scan
+      - docker_scout_scan
+      - build_docker_image
+      - tag_and_push_docker_image
+      - deploy_staging:
+          requires:
+            - build_docker_image
+      - deploy_production:
+          requires:
+            - deploy_staging
+      - deploy_to_docker:
+          requires:
+            - build_docker_image
+      - deploy_to_k8s:
+          requires:
+            - deploy_production
+      - switch_traffic:
+          requires:
+            - deploy_to_k8s
+      - verify_k8s_deployment:
+          requires:
+            - deploy_to_k8s
